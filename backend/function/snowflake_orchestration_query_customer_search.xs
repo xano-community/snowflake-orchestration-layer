@@ -12,6 +12,13 @@ function "snowflake_orchestration_query_customer_search" {
     var $offset { value = (($input.page - 1) * $input.page_size) }
     var $host { value = "https://" ~ $env.SNOWFLAKE_ACCOUNT ~ ".snowflakecomputing.com" }
 
+    // Build bindings as a 1-indexed OBJECT via |set. A `{"1":..}` object literal collapses to a JSON
+    // array on serialization, which the Snowflake SQL API rejects (error 391917).
+    var $bindings { value = {} }
+    var.update $bindings { value = ($bindings|set:"1":{type: "TEXT", value: ($input.status|to_upper)}) }
+    var.update $bindings { value = ($bindings|set:"2":{type: "FIXED", value: ($input.page_size|to_text)}) }
+    var.update $bindings { value = ($bindings|set:"3":{type: "FIXED", value: ($offset|to_text)}) }
+
     var $params {
       value = {
         statement: "SELECT CUSTOMER_ID, NAME, EMAIL, STATUS, CREATED_AT FROM CUSTOMERS WHERE STATUS = ? ORDER BY CREATED_AT DESC LIMIT ? OFFSET ?",
@@ -20,12 +27,7 @@ function "snowflake_orchestration_query_customer_search" {
         schema: $env.SNOWFLAKE_SCHEMA,
         warehouse: $env.SNOWFLAKE_WAREHOUSE,
         role: $env.SNOWFLAKE_ROLE,
-        bindings: {
-          "1": {type: "TEXT", value: ($input.status|to_upper)},
-          "2": {type: "FIXED", value: ($input.page_size|to_text)},
-          "3": {type: "FIXED", value: ($offset|to_text)}
-        },
-        parameters: {CLIENT_SESSION_KEEP_ALIVE: "false"}
+        bindings: $bindings
       }
     }
 

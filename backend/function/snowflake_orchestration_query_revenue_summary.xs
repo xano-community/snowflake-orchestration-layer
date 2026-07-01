@@ -10,6 +10,12 @@ function "snowflake_orchestration_query_revenue_summary" {
     var $object { value = "ORDERS" }
     var $host { value = "https://" ~ $env.SNOWFLAKE_ACCOUNT ~ ".snowflakecomputing.com" }
 
+    // Build bindings as a 1-indexed OBJECT via |set. A `{"1":..}` object literal collapses to a JSON
+    // array on serialization, which the Snowflake SQL API rejects (error 391917).
+    var $bindings { value = {} }
+    var.update $bindings { value = ($bindings|set:"1":{type: "TEXT", value: $input.start_date}) }
+    var.update $bindings { value = ($bindings|set:"2":{type: "TEXT", value: $input.end_date}) }
+
     var $params {
       value = {
         statement: "SELECT TO_CHAR(DATE_TRUNC('MONTH', ORDER_DATE), 'YYYY-MM') AS MONTH, COUNT(*) AS ORDER_COUNT, SUM(AMOUNT) AS TOTAL_REVENUE FROM ORDERS WHERE ORDER_DATE BETWEEN ? AND ? GROUP BY 1 ORDER BY 1",
@@ -18,11 +24,7 @@ function "snowflake_orchestration_query_revenue_summary" {
         schema: $env.SNOWFLAKE_SCHEMA,
         warehouse: $env.SNOWFLAKE_WAREHOUSE,
         role: $env.SNOWFLAKE_ROLE,
-        bindings: {
-          "1": {type: "TEXT", value: $input.start_date},
-          "2": {type: "TEXT", value: $input.end_date}
-        },
-        parameters: {CLIENT_SESSION_KEEP_ALIVE: "false"}
+        bindings: $bindings
       }
     }
 

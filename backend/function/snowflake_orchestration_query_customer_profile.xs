@@ -9,6 +9,11 @@ function "snowflake_orchestration_query_customer_profile" {
     var $object { value = "CUSTOMERS" }
     var $host { value = "https://" ~ $env.SNOWFLAKE_ACCOUNT ~ ".snowflakecomputing.com" }
 
+    // Build bindings as a 1-indexed OBJECT via |set. A `{"1":..}` object literal collapses to a JSON
+    // array on serialization, which the Snowflake SQL API rejects (error 391917).
+    var $bindings { value = {} }
+    var.update $bindings { value = ($bindings|set:"1":{type: "TEXT", value: $input.customer_id}) }
+
     var $params {
       value = {
         statement: "SELECT CUSTOMER_ID, NAME, EMAIL, STATUS, PHONE, CREATED_AT FROM CUSTOMERS WHERE CUSTOMER_ID = ? LIMIT 1",
@@ -17,10 +22,7 @@ function "snowflake_orchestration_query_customer_profile" {
         schema: $env.SNOWFLAKE_SCHEMA,
         warehouse: $env.SNOWFLAKE_WAREHOUSE,
         role: $env.SNOWFLAKE_ROLE,
-        bindings: {
-          "1": {type: "TEXT", value: $input.customer_id}
-        },
-        parameters: {CLIENT_SESSION_KEEP_ALIVE: "false"}
+        bindings: $bindings
       }
     }
 
