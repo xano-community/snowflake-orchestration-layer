@@ -1,197 +1,64 @@
 # Snowflake API Orchestration Layer
 
-A Xano module that puts a **logic-centralization and governance layer in front of Snowflake**. Snowflake stays the source of truth for your data; Xano owns the API contract — shared-secret access control, input validation, a read-through cache, audit logging, and a single normalized response envelope. Drop it into any Xano workspace, point it at your Snowflake account, and your apps call clean, governed REST endpoints instead of issuing raw SQL.
+Put a governed API contract in front of Snowflake. Apps call clean REST endpoints instead of raw SQL — with shared-secret access control, input validation, a 15-minute read-through cache, audit logging, and one normalized response envelope across every query.
 
-> **Honesty note — testing guarantee.** This module ships with unit tests whose Snowflake responses are **mocked from Snowflake's own SQL API v2 documentation** (the example response bodies on the docs pages, cited below), plus credential-free workflow (outcome) tests that exercise the cache-hit and validation-failure paths end-to-end against real seeded Xano tables. With no live Snowflake credentials in CI, the Snowflake-call success path is proven **"correct against the documented contract (mocked)"** — not against a live warehouse. Set the environment variables below to run it against your real Snowflake account.
+Snowflake stays the source of truth for the data; Xano owns the API contract, the access control, and the caching. Push it and three governed endpoints sit in front of your warehouse — the validation, caching, auth, and envelope logic run immediately; wiring your Snowflake account turns on the live queries.
 
-## 1. What this template demonstrates
+## Why this exists
 
-This module demonstrates **Xano as the orchestration / API layer on top of Snowflake**, so application logic lives in one governed place instead of being scattered across clients issuing ad-hoc SQL. It shows:
+The moment more than one app needs warehouse data, "just give it a Snowflake connection" stops being safe. Every client re-implements the same query, there's no shared access control, no caching (so the warehouse — and the bill — takes every read), and each app shapes the response differently. The logic and the governance end up smeared across clients instead of living in one place.
 
-- **Reusable business logic** — one Snowflake query function and one validation function per endpoint, plus a single shared audit-logging function and a shared response-envelope builder. Logic is defined once and reused.
-- **Access control** — every endpoint requires a shared secret (`API_AUTH_SECRET`) before it will touch Snowflake.
-- **Input validation** — requests are validated (allowed status values, page-size bounds, date format and ordering) and rejected with a clear, typed error *before* a query is ever sent to Snowflake.
-- **Transformation / normalization** — Snowflake's positional `rowType` + `data` result format is reshaped into clean, column-keyed row objects, and every endpoint returns the **same** response envelope.
-- **Caching** — `GET /metrics/revenue-summary` is served through a 15-minute read-through cache, so repeated dashboard loads don't re-hit the warehouse.
-- **Audit logging** — every failed request is written to `api_request_logs`; every successful Snowflake query is written to `query_audit_logs`. Data access is fully traceable.
+This template is that one place. Three read endpoints wrap parameterized Snowflake queries behind a single API group: a shared secret gates access, inputs are validated before a query runs, results are cached read-through for 15 minutes (so repeat reads never touch Snowflake), every call is audited, and every response comes back in one normalized envelope. Change a query or a rule once and every consumer gets the same governed answer — and Snowflake sees far fewer queries.
 
-Snowflake remains the system of record. Xano never replaces it — it governs access to it.
+## How it works
 
-## 2. Required environment variables
+- **Auth to Snowflake** — the endpoints call Snowflake's **SQL API v2** with a **Programmatic Access Token** (the `SNOWFLAKE_PASSWORD` value) plus the PROGRAMMATIC_ACCESS_TOKEN token-type header; `SNOWFLAKE_ACCOUNT` builds the host and `DATABASE`/`SCHEMA`/`WAREHOUSE`/`ROLE` set the session context. Queries are parameterized with bind variables (no string interpolation).
+- **Governance per request** — every endpoint runs a shared gate: validate the input, check the API secret, serve from the read-through cache if a fresh result exists (else query Snowflake and cache it for 15 minutes), and wrap the result in the normalized envelope. Every call writes an `api_request_logs` row and a `query_audit_logs` row.
+- **Three endpoints** — customer search, a single customer profile, and a monthly revenue summary (grouped by `DATE_TRUNC('MONTH', ORDER_DATE)`), each backed by a pure validation function and a query function you can point at your own columns.
 
-Set all eight in your Xano workspace (Settings → Environment Variables). **Do not hardcode credentials.**
+## Quick start
 
-| Variable | Purpose |
-| --- | --- |
-| `SNOWFLAKE_ACCOUNT` | Your Snowflake account identifier (e.g. `myorg-myaccount`). Used to build the SQL API host `https://<account>.snowflakecomputing.com`. |
-| `SNOWFLAKE_USERNAME` | The Snowflake user the token belongs to. Sent in the request `User-Agent` for traceability and documents which user the calls run as. |
-| `SNOWFLAKE_PASSWORD` | The **bearer token** used to authenticate to the SQL API — a Snowflake **Programmatic Access Token (PAT)**. See the auth note below: this is sent as `Authorization: Bearer <token>`, *not* as a raw login password. |
-| `SNOWFLAKE_DATABASE` | Database passed as the statement's session context. |
-| `SNOWFLAKE_SCHEMA` | Schema passed as the statement's session context. |
-| `SNOWFLAKE_WAREHOUSE` | Warehouse passed as the statement's session context. |
-| `SNOWFLAKE_ROLE` | Role passed as the statement's session context. |
-| `API_AUTH_SECRET` | Shared secret callers must present (as the `api_secret` request parameter) to use any endpoint. **Required in production** — when it is set, requests without the matching secret are rejected and logged. If it is left **unset**, the secret check is skipped (useful only for a throwaway/dev workspace). |
+1. **Push the backend** to a Xano workspace (the CLI/agent flow below does this).
+2. **Call the endpoints** — `GET /customers/search`, `GET /customers/{customer_id}/profile`, `GET /metrics/revenue-summary`.
+3. **What runs without Snowflake.** Input validation, the shared-secret auth (a no-op when `API_AUTH_SECRET` is unset), the read-through cache on a hit, and the response envelope all run out of the box; the **live queries need your Snowflake account + PAT** and the `CUSTOMERS` / `ORDERS` objects below. Set the [environment variables](#environment-variables) to connect.
 
-### How Snowflake authentication works here (important)
+## API surface
 
-The Snowflake **SQL API v2** does **not** authenticate with a raw username/password. It authenticates with a bearer token plus a token-type header:
+All endpoints live in the `SnowflakeOrchestration` API group (canonical `snowflake-orchestration`), require the `api_secret` field when `API_AUTH_SECRET` is set, and return one normalized envelope. Every call is audited.
 
-```
-POST https://<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com/api/v2/statements
-Authorization: Bearer <SNOWFLAKE_PASSWORD>
-X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN
-Content-Type: application/json
-```
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/customers/search` | Search `CUSTOMERS` (by name/email/status), validated + cached. |
+| `GET` | `/customers/{customer_id}/profile` | A single customer's profile from `CUSTOMERS`. |
+| `GET` | `/metrics/revenue-summary` | Monthly revenue from `ORDERS`, grouped by month (cached 15 min). |
 
-So this module uses `SNOWFLAKE_PASSWORD` as the **Programmatic Access Token** value, `SNOWFLAKE_ACCOUNT` to build the host, and passes `SNOWFLAKE_DATABASE` / `SNOWFLAKE_SCHEMA` / `SNOWFLAKE_WAREHOUSE` / `SNOWFLAKE_ROLE` as the statement request's session context. `SNOWFLAKE_USERNAME` is sent in the `User-Agent` so each call is attributable to a user. To mint a PAT in Snowsight: `ALTER USER <user> ADD PROGRAMMATIC ACCESS TOKEN <name>` (PATs require a network policy on the user/account). You can substitute an OAuth or key-pair-JWT token by changing the token-type header in the query functions.
+## Database Tables
 
-## 3. Required Snowflake tables/views
-
-The shipped query functions read from two objects in your configured database/schema. Provide them as tables or views with at least these columns:
-
-**CUSTOMERS** — used by `/customers/search` and `/customers/{customer_id}/profile`:
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| **CUSTOMER_ID** | text | Unique customer identifier |
-| **NAME** | text | Customer name |
-| **EMAIL** | text | Customer email |
-| **STATUS** | text | One of ACTIVE, INACTIVE, PROSPECT (matched case-insensitively against the request) |
-| **PHONE** | text | Phone (returned by the profile endpoint) |
-| **CREATED_AT** | timestamp | Creation time |
-
-**ORDERS** — used by `/metrics/revenue-summary`:
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| **ORDER_DATE** | date | Order date; revenue is grouped by month via `DATE_TRUNC('MONTH', ORDER_DATE)` |
-| **AMOUNT** | number | Order amount; summed into the monthly TOTAL_REVENUE |
-
-The SQL is parameterized with bind variables, so it adapts to your data without string interpolation. Adjust the column names in the three `snowflake_orchestration_query_*` functions if your schema differs.
-
-## 4. Endpoint reference
-
-All endpoints are `GET`, live under the `snowflake-orchestration` API group, require `api_secret` (when `API_AUTH_SECRET` is set), and return the [normalized envelope](#6-example-responses).
-
-| Method | Path | Required params | Description |
-| --- | --- | --- | --- |
-| GET | `/customers/search` | `status`, `page`, `page_size` | Search customers by status with paging. `status` ∈ {`active`,`inactive`,`prospect`}; `page_size` 1–100. Always `cache_status: "miss"`. |
-| GET | `/customers/{customer_id}/profile` | `customer_id` (path) | Return one canonical customer profile. `customer_id` must be non-empty. Always `cache_status: "miss"`. |
-| GET | `/metrics/revenue-summary` | `start_date`, `end_date` | Revenue summarized by month. Both dates required, `YYYY-MM-DD`, `end_date` ≥ `start_date`. Served from a 15-minute cache (`cache_status: "hit"` when warm, else `"miss"`). |
-
-Optional on every endpoint: `api_secret` (the shared secret) and `requester_id` (recorded in audit logs).
-
-**Validation rules**
-
-- `status` must be one of `active`, `inactive`, `prospect`.
-- `page_size` must be an integer between 1 and 100; `page` must be ≥ 1.
-- `customer_id` must be present and non-empty.
-- `start_date` and `end_date` must both be present and formatted `YYYY-MM-DD`; `end_date` must not be earlier than `start_date`.
-
-A request that fails auth or validation is rejected with an error envelope and recorded in `api_request_logs` — Snowflake is never queried.
-
-## 5. Example requests
-
-> Replace `<base>` with your API base URL, e.g. `https://your-instance.xano.io/api:snowflake-orchestration`.
-
-```sh
-# Customer search
-curl "<base>/customers/search?status=active&page=1&page_size=25&api_secret=$API_AUTH_SECRET"
-
-# Customer profile
-curl "<base>/customers/C001/profile?api_secret=$API_AUTH_SECRET"
-
-# Revenue summary (cached 15 min)
-curl "<base>/metrics/revenue-summary?start_date=2024-01-01&end_date=2024-03-31&api_secret=$API_AUTH_SECRET"
-```
-
-## 6. Example responses
-
-Every endpoint returns this exact envelope:
-
-```json
-{
-  "success": true,
-  "data": {},
-  "metadata": {
-    "request_id": "",
-    "source": "snowflake",
-    "cache_status": "hit_or_miss"
-  },
-  "errors": []
-}
-```
-
-**Customer search (success):**
-
-```json
-{
-  "success": true,
-  "data": {
-    "rows": [
-      { "CUSTOMER_ID": "C001", "NAME": "Acme Corp", "EMAIL": "ops@acme.example", "STATUS": "ACTIVE", "CREATED_AT": "2024-01-15T10:00:00Z" },
-      { "CUSTOMER_ID": "C002", "NAME": "Globex", "EMAIL": "hi@globex.example", "STATUS": "ACTIVE", "CREATED_AT": "2024-02-02T12:30:00Z" }
-    ],
-    "row_count": 2,
-    "page": 1,
-    "page_size": 25
-  },
-  "metadata": { "request_id": "f2b1…", "source": "snowflake", "cache_status": "miss" },
-  "errors": []
-}
-```
-
-**Revenue summary (served from cache):**
-
-```json
-{
-  "success": true,
-  "data": {
-    "by_month": [
-      { "MONTH": "2024-01", "ORDER_COUNT": "120", "TOTAL_REVENUE": "48250.00" },
-      { "MONTH": "2024-02", "ORDER_COUNT": "98",  "TOTAL_REVENUE": "39110.50" },
-      { "MONTH": "2024-03", "ORDER_COUNT": "143", "TOTAL_REVENUE": "60230.75" }
-    ],
-    "row_count": 3,
-    "start_date": "2024-01-01",
-    "end_date": "2024-03-31"
-  },
-  "metadata": { "request_id": "9c4a…", "source": "snowflake", "cache_status": "hit" },
-  "errors": []
-}
-```
-
-**Validation failure (no Snowflake call, logged to `api_request_logs`):**
-
-```json
-{
-  "success": false,
-  "data": {},
-  "metadata": { "request_id": "11de…", "source": "snowflake", "cache_status": "miss" },
-  "errors": ["end_date must not be earlier than start_date"]
-}
-```
-
-## 7. How Xano centralizes logic without replacing Snowflake
-
-Snowflake remains the **single source of truth** for the data. This module is deliberately a thin, governed layer *around* it, not a copy of it:
-
-- **It does not store your business data.** The only Xano tables it owns are operational: `api_request_logs` (failed requests), `query_audit_logs` (successful queries), and `cached_query_results` (a short-lived cache). Customer and order data live in — and are read live from — Snowflake.
-- **It centralizes the logic, not the data.** Validation rules, the SQL for each query, access control, and the response shape are defined **once** in reusable Xano functions. Every client gets the same governed behavior instead of re-implementing it (or issuing raw SQL) per app.
-- **It governs and observes access.** The shared secret gates who can query; the audit tables record what was asked and what ran. You get an access trail Snowflake-side queries alone don't give you.
-- **It protects the warehouse.** Inputs are validated before a query is sent, and the revenue endpoint's 15-minute cache absorbs repeated reads — fewer, cleaner queries hit Snowflake.
-
-The result: a stable, documented API contract for your apps, with Snowflake doing what it does best (storing and computing over the data) and Xano doing what it does best (centralizing logic, access, and orchestration).
-
----
+- **cached_query_results** — the read-through cache: one row per query key with the stored result and its 15-minute expiry.
+- **query_audit_logs** — one row per Snowflake query issued (which query, params, timing).
+- **api_request_logs** — one row per API call (endpoint, requester, status), for access auditing.
 
 ## Testing
 
-Unit-test mocks are taken verbatim from Snowflake's SQL API v2 documentation:
+Run from a deployed workspace with `xano workflow_test run_all` / `xano unit_test run_all`:
+- **`snowflake_orchestration_cache_hit`** — a repeated query serves from `cached_query_results` without touching Snowflake.
+- **`snowflake_orchestration_validation_failure`** — an invalid request is rejected by the validation gate before any query runs.
+- **Unit tests** on the pure validation functions (`snowflake_orchestration_validate_*`).
 
-- Request body / bindings — <https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests>
-- Success response (`resultSetMetaData`, `rowType`, `data`, `partitionInfo`) — <https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses> and <https://docs.snowflake.com/en/developer-guide/sql-api/reference>
+These exercise the validation, cache, and envelope logic without a Snowflake account; the live query path requires your credentials.
 
-## License
+## Environment variables
 
-MIT — see [LICENSE](./LICENSE).
+Set these to connect your Snowflake account. The validation/cache/auth/envelope logic runs without them.
+
+- `SNOWFLAKE_ACCOUNT` — your account identifier; builds the `https://<account>.snowflakecomputing.com` host.
+- `SNOWFLAKE_PASSWORD` — the **Programmatic Access Token** value, sent as the Bearer token (mint via `ALTER USER <user> ADD PROGRAMMATIC ACCESS TOKEN <name>`; PATs require a network policy on the user/account).
+- `SNOWFLAKE_USERNAME` — the user the token belongs to; sent in the `User-Agent` so calls are attributable.
+- `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_ROLE` — the statement session context.
+- `API_AUTH_SECRET` — shared secret every endpoint checks (`api_secret` field). When unset the check is a no-op so it runs out of the box; set it in production.
+
+**Required Snowflake objects.** The query functions read two objects in your configured database/schema — provide them as tables or views:
+- **`CUSTOMERS`** (`/customers/search`, `/customers/{id}/profile`): CUSTOMER_ID, `NAME`, `EMAIL`, `STATUS` (ACTIVE/INACTIVE/PROSPECT), `PHONE`, CREATED_AT.
+- **`ORDERS`** (`/metrics/revenue-summary`): ORDER_DATE (grouped by month), `AMOUNT` (summed).
+
+Adjust the column names in the three `snowflake_orchestration_query_*` functions if your schema differs.
