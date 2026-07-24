@@ -24,7 +24,7 @@ This template is that one place. Three read endpoints wrap parameterized Snowfla
 
 ## API surface
 
-All endpoints live in the `SnowflakeOrchestration` API group (canonical `snowflake-orchestration`), require the `api_secret` field when `API_AUTH_SECRET` is set, and return one normalized envelope. Every call is audited.
+All endpoints live in the `SnowflakeOrchestration` API group (Xano assigns its `api:<canonical>` slug per install), require the `api_secret` field when `API_AUTH_SECRET` is set, and return one normalized envelope. Every call is audited.
 
 | Method | Path | Purpose |
 |---|---|---|
